@@ -15,14 +15,14 @@
 
 
 const int kNumPresets = 1;
-// The plugin is mono inside
-constexpr size_t kNumChannelsInternal = 1;
+// The plugin can be mono or stereo (user-configurable via kStereo parameter)
+constexpr size_t kMaxChannelsInternal = 2;
 
-class NAMSender : public iplug::IPeakAvgSender<>
+class NAMSender : public iplug::IPeakAvgSender<2>
 {
 public:
   NAMSender()
-  : iplug::IPeakAvgSender<>(-90.0, true, 5.0f, 1.0f, 300.0f, 500.0f)
+  : iplug::IPeakAvgSender<2>(-90.0, true, 5.0f, 1.0f, 300.0f, 500.0f)
   {
   }
 };
@@ -45,6 +45,7 @@ enum EParams
   kCalibrateInput,
   kInputCalibrationLevel,
   kOutputMode,
+  kStereo,
   kNumParams
 };
 
@@ -202,15 +203,11 @@ public:
   bool OnMessage(int msgTag, int ctrlTag, int dataSize, const void* pData) override;
 
 private:
-  // Allocates mInputPointers and mOutputPointers
-  void _AllocateIOPointers(const size_t nChans);
   // Moves DSP modules from staging area to the main area.
   // Also deletes DSP modules that are flagged for removal.
   // Exists so that we don't try to use a DSP module that's only
   // partially-instantiated.
   void _ApplyDSPStaging();
-  // Deallocates mInputPointers and mOutputPointers
-  void _DeallocateIOPointers();
   // Fallback that just copies inputs to outputs if mDSP doesn't hold a model.
   void _FallbackDSP(iplug::sample** inputs, iplug::sample** outputs, const size_t numChannels, const size_t numFrames);
   // Sizes based on mInputArray
@@ -271,8 +268,8 @@ private:
   // Output from NAM
   std::vector<std::vector<iplug::sample>> mOutputArray;
   // Pointer versions
-  iplug::sample** mInputPointers = nullptr;
-  iplug::sample** mOutputPointers = nullptr;
+  std::vector<iplug::sample*> mInputPointers;
+  std::vector<iplug::sample*> mOutputPointers;
 
   // Input and output gain
   double mInputGain = 1.0;
@@ -281,16 +278,19 @@ private:
   // Noise gates
   dsp::noise_gate::Trigger mNoiseGateTrigger;
   dsp::noise_gate::Gain mNoiseGateGain;
-  // The model actually being used:
+  // The model actually being used (shared by both channels in stereo mode)
   std::unique_ptr<ResamplingNAM> mModel;
-  // And the IR
-  std::unique_ptr<dsp::ImpulseResponse> mIR;
+  // And the IR (separate per channel for true stereo IR processing)
+  std::unique_ptr<dsp::ImpulseResponse> mIRs[kMaxChannelsInternal];
   // Manages switching what DSP is being used.
   std::unique_ptr<ResamplingNAM> mStagedModel;
-  std::unique_ptr<dsp::ImpulseResponse> mStagedIR;
+  std::unique_ptr<dsp::ImpulseResponse> mStagedIRs[kMaxChannelsInternal];
   // Flags to take away the modules at a safe time.
   std::atomic<bool> mShouldRemoveModel = false;
   std::atomic<bool> mShouldRemoveIR = false;
+  // Flags to signal when staging is complete and ready to apply
+  std::atomic<bool> mStagedModelReady = false;
+  std::atomic<bool> mStagedIRsReady = false;
 
   std::atomic<bool> mNewModelLoadedInDSP = false;
   std::atomic<bool> mModelCleared = false;

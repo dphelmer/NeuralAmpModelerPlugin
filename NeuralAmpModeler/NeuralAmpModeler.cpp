@@ -93,6 +93,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
   GetParam(kCalibrateInput)->InitBool(kCalibrateInputParamName.c_str(), kDefaultCalibrateInput);
   GetParam(kInputCalibrationLevel)
     ->InitDouble(kInputCalibrationLevelParamName.c_str(), kDefaultInputCalibrationLevel, -60.0, 60.0, 0.1, "dBu");
+  GetParam(kStereo)->InitBool("Stereo", false);
 
   mNoiseGateTrigger.AddListener(&mNoiseGateGain);
 
@@ -159,6 +160,8 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     const auto ngToggleArea =
       noiseGateArea.GetVShifted(noiseGateArea.H()).SubRectVertical(2, 0).GetReducedFromTop(10.0f);
     const auto eqToggleArea = midKnobArea.GetVShifted(midKnobArea.H()).SubRectVertical(2, 0).GetReducedFromTop(10.0f);
+    const auto stereoToggleArea =
+      outputKnobArea.GetVShifted(outputKnobArea.H()).SubRectVertical(2, 0).GetReducedFromTop(10.0f);
 
     // Areas for model and IR
     const auto fileWidth = 200.0f;
@@ -239,6 +242,7 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
     pGraphics->AttachControl(
       new NAMSwitchControl(ngToggleArea, kNoiseGateActive, "Noise Gate", style, switchHandleBitmap));
     pGraphics->AttachControl(new NAMSwitchControl(eqToggleArea, kEQActive, "EQ", style, switchHandleBitmap));
+    pGraphics->AttachControl(new NAMSwitchControl(stereoToggleArea, kStereo, "Stereo", style, switchHandleBitmap));
 
     // The knobs
     pGraphics->AttachControl(new NAMKnobControl(inputKnobArea, kInputLevel, "", style, knobBackgroundBitmap));
@@ -281,14 +285,14 @@ NeuralAmpModeler::NeuralAmpModeler(const InstanceInfo& info)
 
 NeuralAmpModeler::~NeuralAmpModeler()
 {
-  _DeallocateIOPointers();
+  // Cleanup is automatic with std::vector and std::unique_ptr
 }
 
 void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outputs, int nFrames)
 {
   const size_t numChannelsExternalIn = (size_t)NInChansConnected();
   const size_t numChannelsExternalOut = (size_t)NOutChansConnected();
-  const size_t numChannelsInternal = kNumChannelsInternal;
+  const size_t numChannelsInternal = GetParam(kStereo)->Bool() ? 2 : 1;
   const size_t numFrames = (size_t)nFrames;
   const double sampleRate = GetSampleRate();
 
@@ -305,7 +309,7 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   const bool toneStackActive = GetParam(kEQActive)->Value();
 
   // Noise gate trigger
-  sample** triggerOutput = mInputPointers;
+  sample** triggerOutput = mInputPointers.data();
   if (noiseGateActive)
   {
     const double time = 0.01;
@@ -317,28 +321,53 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
     const dsp::noise_gate::TriggerParams triggerParams(time, threshold, ratio, openTime, holdTime, closeTime);
     mNoiseGateTrigger.SetParams(triggerParams);
     mNoiseGateTrigger.SetSampleRate(sampleRate);
-    triggerOutput = mNoiseGateTrigger.Process(mInputPointers, numChannelsInternal, numFrames);
+    triggerOutput = mNoiseGateTrigger.Process(mInputPointers.data(), numChannelsInternal, numFrames);
   }
 
   if (mModel != nullptr)
   {
-    mModel->process(triggerOutput[0], mOutputPointers[0], nFrames);
+    // Process each channel sequentially through the shared model
+    // This is safe and allows Eigen to parallelize within each call
+    for (size_t c = 0; c < numChannelsInternal; c++)
+    {
+      mModel->process(triggerOutput[c], mOutputPointers[c], (int)numFrames);
+    }
   }
   else
   {
-    _FallbackDSP(triggerOutput, mOutputPointers, numChannelsInternal, numFrames);
+    _FallbackDSP(triggerOutput, mOutputPointers.data(), numChannelsInternal, numFrames);
   }
   // Apply the noise gate after the NAM
   sample** gateGainOutput =
-    noiseGateActive ? mNoiseGateGain.Process(mOutputPointers, numChannelsInternal, numFrames) : mOutputPointers;
+    noiseGateActive ? mNoiseGateGain.Process(mOutputPointers.data(), numChannelsInternal, numFrames) : mOutputPointers.data();
 
   sample** toneStackOutPointers = (toneStackActive && mToneStack != nullptr)
-                                    ? mToneStack->Process(gateGainOutput, numChannelsInternal, nFrames)
+                                    ? mToneStack->Process(gateGainOutput, (int)numChannelsInternal, (int)nFrames)
                                     : gateGainOutput;
 
   sample** irPointers = toneStackOutPointers;
-  if (mIR != nullptr && GetParam(kIRToggle)->Value())
-    irPointers = mIR->Process(toneStackOutPointers, numChannelsInternal, numFrames);
+  if (mIRs[0] != nullptr && GetParam(kIRToggle)->Value())
+  {
+    // Process each channel through its corresponding IR
+    for (size_t c = 0; c < numChannelsInternal; c++)
+    {
+      if (mIRs[c])
+      {
+        sample* chanIn = toneStackOutPointers[c];
+        sample** chanOutPtrs = mIRs[c]->Process(&chanIn, 1, numFrames);
+        // Copy IR output to our buffer
+        for (size_t s = 0; s < numFrames; s++)
+          mOutputArray[c][s] = chanOutPtrs[0][s];
+      }
+      else
+      {
+        // Fallback: pass through if IR not loaded for this channel
+        for (size_t s = 0; s < numFrames; s++)
+          mOutputArray[c][s] = toneStackOutPointers[c][s];
+      }
+    }
+    irPointers = mOutputPointers.data();
+  }
 
   // And the HPF for DC offset (Issue 271)
   const double highPassCutoffFreq = kDCBlockerFrequency;
@@ -359,15 +388,16 @@ void NeuralAmpModeler::ProcessBlock(iplug::sample** inputs, iplug::sample** outp
   // _ProcessOutput(lpfPointers, outputs, numFrames, numChannelsInternal, numChannelsExternalOut);
   // * Output of input leveling (inputs -> mInputPointers),
   // * Output of output leveling (mOutputPointers -> outputs)
-  _UpdateMeters(mInputPointers, outputs, numFrames, numChannelsInternal, numChannelsExternalOut);
+  _UpdateMeters(mInputPointers.data(), outputs, numFrames, numChannelsInternal, numChannelsExternalOut);
 }
 
 void NeuralAmpModeler::OnReset()
 {
   const auto sampleRate = GetSampleRate();
   const int maxBlockSize = GetBlockSize();
+  const size_t numChannelsInternal = GetParam(kStereo)->Bool() ? 2 : 1;
 
-  // Tail is because the HPF DC blocker has a decay.
+  _PrepareBuffers(numChannelsInternal, (size_t)maxBlockSize);
   // 10 cycles should be enough to pass the VST3 tests checking tail behavior.
   // I'm ignoring the model & IR, but it's not the end of the world.
   const int tailCycles = 10;
@@ -375,7 +405,7 @@ void NeuralAmpModeler::OnReset()
   mInputSender.Reset(sampleRate);
   mOutputSender.Reset(sampleRate);
   // If there is a model or IR loaded, they need to be checked for resampling.
-  _ResetModelAndIR(sampleRate, GetBlockSize());
+  _ResetModelAndIR(sampleRate, maxBlockSize);
   mToneStack->Reset(sampleRate, maxBlockSize);
   _UpdateLatency();
 }
@@ -454,7 +484,7 @@ void NeuralAmpModeler::OnUIOpen()
   if (mIRPath.GetLength())
   {
     SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
-    if (mIR == nullptr && mStagedIR == nullptr)
+    if (mIRs[0] == nullptr && mStagedIRs[0] == nullptr)
       SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
   }
 
@@ -479,6 +509,8 @@ void NeuralAmpModeler::OnParamChange(int paramIdx)
     case kToneBass: mToneStack->SetParam("bass", GetParam(paramIdx)->Value()); break;
     case kToneMid: mToneStack->SetParam("middle", GetParam(paramIdx)->Value()); break;
     case kToneTreble: mToneStack->SetParam("treble", GetParam(paramIdx)->Value()); break;
+    // Stereo mode change requires buffer reallocation
+    case kStereo: OnReset(); break;
     default: break;
   }
 }
@@ -535,18 +567,15 @@ bool NeuralAmpModeler::OnMessage(int msgTag, int ctrlTag, int dataSize, const vo
 
 // Private methods ============================================================
 
-void NeuralAmpModeler::_AllocateIOPointers(const size_t nChans)
+void NeuralAmpModeler::_PrepareIOPointers(const size_t numChannels)
 {
-  if (mInputPointers != nullptr)
-    throw std::runtime_error("Tried to re-allocate mInputPointers without freeing");
-  mInputPointers = new sample*[nChans];
-  if (mInputPointers == nullptr)
-    throw std::runtime_error("Failed to allocate pointer to input buffer!\n");
-  if (mOutputPointers != nullptr)
-    throw std::runtime_error("Tried to re-allocate mOutputPointers without freeing");
-  mOutputPointers = new sample*[nChans];
-  if (mOutputPointers == nullptr)
-    throw std::runtime_error("Failed to allocate pointer to output buffer!\n");
+  mInputPointers.resize(numChannels);
+  mOutputPointers.resize(numChannels);
+  for (size_t c = 0; c < numChannels; c++)
+  {
+    mInputPointers[c] = mInputArray[c].data();
+    mOutputPointers[c] = mOutputArray[c].data();
+  }
 }
 
 void NeuralAmpModeler::_ApplyDSPStaging()
@@ -564,43 +593,32 @@ void NeuralAmpModeler::_ApplyDSPStaging()
   }
   if (mShouldRemoveIR)
   {
-    mIR = nullptr;
+    for (size_t c = 0; c < kMaxChannelsInternal; c++)
+      mIRs[c] = nullptr;
     mIRPath.Set("");
     mShouldRemoveIR = false;
   }
   // Move things from staged to live
-  if (mStagedModel != nullptr)
+  // Use atomic flags to ensure complete loading before applying
+  if (mStagedModelReady.load())
   {
     mModel = std::move(mStagedModel);
     mStagedModel = nullptr;
+    mStagedModelReady = false;
     mNewModelLoadedInDSP = true;
     _UpdateLatency();
     _SetInputGain();
     _SetOutputGain();
   }
-  if (mStagedIR != nullptr)
+  if (mStagedIRsReady.load())
   {
-    mIR = std::move(mStagedIR);
-    mStagedIR = nullptr;
+    for (size_t c = 0; c < kMaxChannelsInternal; c++)
+    {
+      mIRs[c] = std::move(mStagedIRs[c]);
+      mStagedIRs[c] = nullptr;
+    }
+    mStagedIRsReady = false;
   }
-}
-
-void NeuralAmpModeler::_DeallocateIOPointers()
-{
-  if (mInputPointers != nullptr)
-  {
-    delete[] mInputPointers;
-    mInputPointers = nullptr;
-  }
-  if (mInputPointers != nullptr)
-    throw std::runtime_error("Failed to deallocate pointer to input buffer!\n");
-  if (mOutputPointers != nullptr)
-  {
-    delete[] mOutputPointers;
-    mOutputPointers = nullptr;
-  }
-  if (mOutputPointers != nullptr)
-    throw std::runtime_error("Failed to deallocate pointer to output buffer!\n");
 }
 
 void NeuralAmpModeler::_FallbackDSP(iplug::sample** inputs, iplug::sample** outputs, const size_t numChannels,
@@ -624,22 +642,25 @@ void NeuralAmpModeler::_ResetModelAndIR(const double sampleRate, const int maxBl
   }
 
   // IR
-  if (mStagedIR != nullptr)
+  for (size_t c = 0; c < kMaxChannelsInternal; c++)
   {
-    const double irSampleRate = mStagedIR->GetSampleRate();
-    if (irSampleRate != sampleRate)
+    if (mStagedIRs[c] != nullptr)
     {
-      const auto irData = mStagedIR->GetData();
-      mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      const double irSampleRate = mStagedIRs[c]->GetSampleRate();
+      if (irSampleRate != sampleRate)
+      {
+        const auto irData = mStagedIRs[c]->GetData();
+        mStagedIRs[c] = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      }
     }
-  }
-  else if (mIR != nullptr)
-  {
-    const double irSampleRate = mIR->GetSampleRate();
-    if (irSampleRate != sampleRate)
+    else if (mIRs[c] != nullptr)
     {
-      const auto irData = mIR->GetData();
-      mStagedIR = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      const double irSampleRate = mIRs[c]->GetSampleRate();
+      if (irSampleRate != sampleRate)
+      {
+        const auto irData = mIRs[c]->GetData();
+        mStagedIRs[c] = std::make_unique<dsp::ImpulseResponse>(irData, sampleRate);
+      }
     }
   }
 }
@@ -692,10 +713,18 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   try
   {
     auto dspPath = std::filesystem::u8path(modelPath.Get());
+    
+    // Load a single model instance (shared by both channels in stereo)
     std::unique_ptr<nam::DSP> model = nam::get_dsp(dspPath);
-    std::unique_ptr<ResamplingNAM> temp = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
-    temp->Reset(GetSampleRate(), GetBlockSize());
-    mStagedModel = std::move(temp);
+    std::unique_ptr<ResamplingNAM> tempModel = std::make_unique<ResamplingNAM>(std::move(model), GetSampleRate());
+    tempModel->Reset(GetSampleRate(), GetBlockSize());
+
+    // Move to staging area, then signal ready atomically
+    mStagedModel = std::move(tempModel);
+    
+    // Signal that staged model is ready to be applied by DSP thread
+    mStagedModelReady = true;
+
     mNAMPath = modelPath;
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadedModel, mNAMPath.GetLength(), mNAMPath.Get());
   }
@@ -703,10 +732,8 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
   {
     SendControlMsgFromDelegate(kCtrlTagModelFileBrowser, kMsgTagLoadFailed);
 
-    if (mStagedModel != nullptr)
-    {
-      mStagedModel = nullptr;
-    }
+    mStagedModel = nullptr;
+    mStagedModelReady = false;
     mNAMPath = previousNAMPath;
     std::cerr << "Failed to read DSP module" << std::endl;
     std::cerr << e.what() << std::endl;
@@ -717,37 +744,47 @@ std::string NeuralAmpModeler::_StageModel(const WDL_String& modelPath)
 
 dsp::wav::LoadReturnCode NeuralAmpModeler::_StageIR(const WDL_String& irPath)
 {
-  // FIXME it'd be better for the path to be "staged" as well. Just in case the
-  // path and the model got caught on opposite sides of the fence...
   WDL_String previousIRPath = mIRPath;
   const double sampleRate = GetSampleRate();
   dsp::wav::LoadReturnCode wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
   try
   {
     auto irPathU8 = std::filesystem::u8path(irPath.Get());
-    mStagedIR = std::make_unique<dsp::ImpulseResponse>(irPathU8.string().c_str(), sampleRate);
-    wavState = mStagedIR->GetWavState();
+    std::unique_ptr<dsp::ImpulseResponse> tempIRs[kMaxChannelsInternal];
+    for (size_t c = 0; c < kMaxChannelsInternal; c++)
+    {
+      tempIRs[c] = std::make_unique<dsp::ImpulseResponse>(irPathU8.string().c_str(), sampleRate);
+    }
+    wavState = tempIRs[0]->GetWavState();
+
+    if (wavState == dsp::wav::LoadReturnCode::SUCCESS)
+    {
+      for (size_t c = 0; c < kMaxChannelsInternal; c++)
+        mStagedIRs[c] = std::move(tempIRs[c]);
+      
+      // Signal that staged IRs are ready to be applied by DSP thread
+      mStagedIRsReady = true;
+      
+      mIRPath = irPath;
+      SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
+    }
+    else
+    {
+      for (size_t c = 0; c < kMaxChannelsInternal; c++)
+        mStagedIRs[c] = nullptr;
+      mStagedIRsReady = false;
+      mIRPath = previousIRPath;
+      SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
+    }
   }
   catch (std::runtime_error& e)
   {
     wavState = dsp::wav::LoadReturnCode::ERROR_OTHER;
+    for (size_t c = 0; c < kMaxChannelsInternal; c++)
+      mStagedIRs[c] = nullptr;
+    mStagedIRsReady = false;
     std::cerr << "Caught unhandled exception while attempting to load IR:" << std::endl;
     std::cerr << e.what() << std::endl;
-  }
-
-  if (wavState == dsp::wav::LoadReturnCode::SUCCESS)
-  {
-    mIRPath = irPath;
-    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadedIR, mIRPath.GetLength(), mIRPath.Get());
-  }
-  else
-  {
-    if (mStagedIR != nullptr)
-    {
-      mStagedIR = nullptr;
-    }
-    mIRPath = previousIRPath;
-    SendControlMsgFromDelegate(kCtrlTagIRFileBrowser, kMsgTagLoadFailed);
   }
 
   return wavState;
@@ -804,38 +841,51 @@ void NeuralAmpModeler::_PrepareBuffers(const size_t numChannels, const size_t nu
     mOutputPointers[c] = mOutputArray[c].data();
 }
 
-void NeuralAmpModeler::_PrepareIOPointers(const size_t numChannels)
-{
-  _DeallocateIOPointers();
-  _AllocateIOPointers(numChannels);
-}
+
 
 void NeuralAmpModeler::_ProcessInput(iplug::sample** inputs, const size_t nFrames, const size_t nChansIn,
                                      const size_t nChansOut)
 {
-  // We'll assume that the main processing is mono for now. We'll handle dual amps later.
-  if (nChansOut != 1)
+  double gain = mInputGain;
+  if (nChansOut == 1)
+  {
+    // Mono summing logic
+#ifndef APP_API
+    gain /= (double)nChansIn;
+#endif
+    for (size_t s = 0; s < nFrames; s++)
+    {
+      mInputArray[0][s] = 0.0;
+      for (size_t c = 0; c < nChansIn; c++)
+        mInputArray[0][s] += gain * inputs[c][s];
+    }
+  }
+  else if (nChansOut == 2)
+  {
+    // Stereo mapping logic
+    if (nChansIn == 1)
+    {
+      for (size_t s = 0; s < nFrames; s++)
+      {
+        mInputArray[0][s] = gain * inputs[0][s];
+        mInputArray[1][s] = gain * inputs[0][s];
+      }
+    }
+    else
+    {
+      for (size_t s = 0; s < nFrames; s++)
+      {
+        mInputArray[0][s] = gain * inputs[0][s];
+        mInputArray[1][s] = gain * inputs[1][s];
+      }
+    }
+  }
+  else
   {
     std::stringstream ss;
-    ss << "Expected mono output, but " << nChansOut << " output channels are requested!";
+    ss << "Expected mono or stereo internal, but " << nChansOut << " output channels are requested!";
     throw std::runtime_error(ss.str());
   }
-
-  // On the standalone, we can probably assume that the user has plugged into only one input and they expect it to be
-  // carried straight through. Don't apply any division over nChansIn because we're just "catching anything out there."
-  // However, in a DAW, it's probably something providing stereo, and we want to take the average in order to avoid
-  // doubling the loudness. (This would change w/ double mono processing)
-  double gain = mInputGain;
-#ifndef APP_API
-  gain /= (float)nChansIn;
-#endif
-  // Assume _PrepareBuffers() was already called
-  for (size_t c = 0; c < nChansIn; c++)
-    for (size_t s = 0; s < nFrames; s++)
-      if (c == 0)
-        mInputArray[0][s] = gain * inputs[c][s];
-      else
-        mInputArray[0][s] += gain * inputs[c][s];
 }
 
 void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** outputs, const size_t nFrames,
@@ -843,18 +893,32 @@ void NeuralAmpModeler::_ProcessOutput(iplug::sample** inputs, iplug::sample** ou
 {
   const double gain = mOutputGain;
   // Assume _PrepareBuffers() was already called
-  if (nChansIn != 1)
-    throw std::runtime_error("Plugin is supposed to process in mono.");
-  // Broadcast the internal mono stream to all output channels.
-  const size_t cin = 0;
-  for (auto cout = 0; cout < nChansOut; cout++)
-    for (auto s = 0; s < nFrames; s++)
+  if (nChansIn == 1)
+  {
+    // Broadcast the internal mono stream to all output channels.
+    for (auto cout = 0; cout < nChansOut; cout++)
+      for (auto s = 0; s < nFrames; s++)
 #ifdef APP_API // Ensure valid output to interface
-      outputs[cout][s] = std::clamp(gain * inputs[cin][s], -1.0, 1.0);
+        outputs[cout][s] = std::clamp(gain * inputs[0][s], -1.0, 1.0);
 #else // In a DAW, other things may come next and should be able to handle large
       // values.
-      outputs[cout][s] = gain * inputs[cin][s];
+        outputs[cout][s] = gain * inputs[0][s];
 #endif
+  }
+  else if (nChansIn == 2)
+  {
+    for (auto cout = 0; cout < nChansOut; cout++)
+      for (auto s = 0; s < nFrames; s++)
+#ifdef APP_API // Ensure valid output to interface
+        outputs[cout][s] = std::clamp(gain * inputs[cout % 2][s], -1.0, 1.0);
+#else
+        outputs[cout][s] = gain * inputs[cout % 2][s];
+#endif
+  }
+  else
+  {
+    throw std::runtime_error("Plugin is supposed to process in mono or stereo.");
+  }
 }
 
 void NeuralAmpModeler::_UpdateControlsFromModel()
@@ -905,10 +969,8 @@ void NeuralAmpModeler::_UpdateLatency()
 void NeuralAmpModeler::_UpdateMeters(sample** inputPointer, sample** outputPointer, const size_t nFrames,
                                      const size_t nChansIn, const size_t nChansOut)
 {
-  // Right now, we didn't specify MAXNC when we initialized these, so it's 1.
-  const int nChansHack = 1;
-  mInputSender.ProcessBlock(inputPointer, (int)nFrames, kCtrlTagInputMeter, nChansHack);
-  mOutputSender.ProcessBlock(outputPointer, (int)nFrames, kCtrlTagOutputMeter, nChansHack);
+  mInputSender.ProcessBlock(inputPointer, (int)nFrames, kCtrlTagInputMeter, (int)nChansIn);
+  mOutputSender.ProcessBlock(outputPointer, (int)nFrames, kCtrlTagOutputMeter, (int)nChansOut);
 }
 
 // HACK
